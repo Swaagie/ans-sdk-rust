@@ -37,6 +37,14 @@ RUST_LOG=ans_verify=debug cargo run -p ans-verify --example verify_mtls_client
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_server_scitt
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_mtls_scitt
 
+# Run the self-contained DPoP / Method B example (both sides, in-memory)
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
+
+# Run SCITT/DPoP verification benchmarks (criterion)
+cargo bench -p ans-verify --features scitt,test-support
+# ... with ring-backed ECDSA verification (fast-verify feature)
+cargo bench -p ans-verify --features scitt,test-support,fast-verify
+
 # Check formatting and lints
 cargo fmt --all -- --check
 cargo clippy --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
@@ -53,10 +61,16 @@ cargo clippy --fix --workspace --features ans-verify/test-support,ans-verify/rus
 All changes must pass before merging:
 
 ```bash
-cargo fmt --all -- --check                                                              # Formatting
-cargo clippy --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt  # No warnings
-cargo test --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt    # All tests pass
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+cargo test --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+cargo clippy --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt,ans-verify/fast-verify
+cargo test --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt,ans-verify/fast-verify
 ```
+
+CI also runs benchmark smoke tests and Rust 1.88 checks for both signature
+backends. The feature selects the verification backend; both dependency graphs
+already contain native code.
 
 ## Releasing
 
@@ -138,17 +152,21 @@ Server verification (`verify_server`):
 
 1. Check badge cache by FQDN
 2. DNS lookup: `_ans-badge.{fqdn}` TXT record (fallback: `_ra-badge.{fqdn}`) → transparency log URL
-3. Fetch badge from transparency log API
+3. Enforce the configured trusted-TL allowlist, then fetch the badge
 4. Validate badge status (`Active`/`Warning`/`Deprecated` allowed)
-5. Compare server certificate fingerprint to badge's `attestations.server_cert.fingerprint`
-6. Compare certificate CN to badge's `agent.host`
-7. Optional: DANE/TLSA verification if policy enabled
+5. Match any server certificate fingerprint in V2 `serverCerts` (V1 singular attestations remain supported)
+6. Anchor to the dialed host (ANS-6 §5.1): badge's `agent.host` and the certificate host must both equal the FQDN the caller dialed — badge fields alone verify a consistent story, not the right peer
+7. Optional: DANE/TLSA verification if policy enabled, on every successful path including fresh/stale badge cache hits and SCITT results
+
+Failure handling (ANS-6 §9.1/§9.2): NXDOMAIN on the badge lookup is a determinate answer — possibly the post-revocation state — and rejects regardless of `FailurePolicy`; a cached pre-revocation badge is never a fallback for it. `FailOpenWithCache { max_staleness }` applies only to indeterminate failures (SERVFAIL/timeout, TL unreachable) and may serve cache entries past their freshness TTL via the `*_allow_stale` getters — `CacheConfig::hard_ttl` (eviction bound, default 4× the freshness TTL) must be ≥ `max_staleness` for the window to exist.
+
+Determinate DNS/TL failures, including absent records, 404 responses, and malformed badges, invalidate cached positive state so a later outage cannot restore it. V2 revocation events and server-only registrations must deserialize without singular or identity-certificate fields.
 
 Client verification (`verify_client`) for mTLS:
 
 1. Extract FQDN from certificate CN, version from URI SAN (`ans://...`)
 2. DNS lookup by FQDN, match badge to certificate version
-3. Compare identity certificate fingerprint to badge's `attestations.identity_cert.fingerprint`
+3. Match any identity certificate fingerprint in V2 `identityCerts` (V1 singular attestations remain supported); absence rejects client authentication
 4. Compare ANS name from URI SAN to badge's `ans_name`
 
 ### SCITT Verification Flow (feature = "scitt")
@@ -157,8 +175,8 @@ SCITT-enhanced verification (`verify_server_with_scitt` / `verify_client_with_sc
 
 1. Parse SCITT headers (`X-SCITT-Receipt`, `X-ANS-Status-Token`)
 2. If status token present: verify COSE_Sign1 signature, check expiry, validate status
-3. Match certificate fingerprint against token's cert array
-4. If receipt present: verify Merkle inclusion proof
+3. Match certificate fingerprint against the token's cert array and bind peer names, including the full client URI SAN on cache hits
+4. If receipt present: verify its signature and Merkle proof, then bind the full ANS name, agent identifier, and peer host
 5. Result is `VerificationOutcome::ScittVerified` with verification tier
 
 Fallback behavior (governed by `ScittTierPolicy`):
@@ -170,6 +188,21 @@ Key rules:
 - Present headers are final: any SCITT failure (including `TokenExpired`) = REJECT, no badge fallback
 - Badge fallback only when SCITT headers are completely absent
 - Terminal status (`REVOKED`/`EXPIRED`) = always reject regardless of policy
+
+### DPoP / Method B (feature = "scitt")
+
+Application-layer proof of possession for A2A traffic that crosses TLS-terminating proxies (`Signer`, `verify_caller`):
+
+1. Caller mints a compact DPoP proof (`DPoP` header) with `x5c` bound to the identity certificate
+2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
+3. The `x5c[0]` validity period must contain `now` (± pop skew) — fingerprint arrays never prune rotated-away certs, so the certificate's dates are its only expiry (ANS-6 §7.5)
+4. Receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`); receipts are required by default, and any supplied receipt must verify and agree even if absence is waived
+5. Missing status token is a hard reject — Method B does not fall back to the badge tier
+6. `jti` is recorded only after identity and content binding succeed; expired replay reservations reject
+7. Every proof carries `ans_content_digest`, including the empty-content digest (§7.13). Use `verify_caller_with_content` to enforce size/read limits and hash only after identity binding; hash transfer-decoded bytes with content coding still applied. Content binding is unconditional
+8. Minted proofs state revision `1` (`ans_profile`, §7.12); absence means revision 1, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred
+
+The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
 
 ### DNS Discovery Profiles
 
@@ -245,6 +278,7 @@ let tlog = Arc::new(MockTransparencyLogClient::new()
     .with_badge("https://tlog.example.com/badge", badge));
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["tlog.example.com"])
     .dns_resolver(dns)
     .tlog_client(tlog)
     .build()
@@ -280,3 +314,4 @@ Test fixtures use `rstest` for parameterized tests and `test-log` for tracing ou
 - **Status Token**: COSE_Sign1-signed current-status claim with certificate fingerprint arrays
 - **COSE_Sign1**: CBOR Object Signing (RFC 9052) — used for receipt and status token signatures
 - **C2SP key**: Key format `{issuer}+{key_id_hex}+{spki_base64}` for transparency log root keys
+- **DPoP / Method B**: RFC 9449 proof of possession in the `DPoP` header, bound to the identity certificate via `x5c` and to the transparency log via the status token (no mTLS required)

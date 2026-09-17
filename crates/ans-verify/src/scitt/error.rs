@@ -82,6 +82,24 @@ pub enum ScittError {
         key_domain: String,
     },
 
+    /// Status token names a different host than the one the caller dialed
+    /// (ANS-6 §5.2 — the artifacts alone cannot supply this anchor).
+    #[error("Host mismatch: dialed {expected:?} but status token names {actual:?}")]
+    HostMismatch {
+        /// The host the caller resolved and dialed.
+        expected: String,
+        /// The host from the status token's `ansName`.
+        actual: String,
+    },
+
+    /// Signed receipt does not contain a usable ANS event identity.
+    #[error("Invalid receipt identity: {0}")]
+    InvalidReceiptIdentity(String),
+
+    /// Certificate, receipt, and status token do not name the same peer.
+    #[error("ANS identity binding failed: {0}")]
+    IdentityBinding(String),
+
     // ── Merkle ──
     /// Merkle inclusion proof is structurally invalid.
     #[error("Merkle proof invalid: {0}")]

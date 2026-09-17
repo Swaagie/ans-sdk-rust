@@ -25,6 +25,7 @@ Verification relies on:
 - **Certificate fingerprint comparison** to ensure the presented certificate matches the registered identity
 - **DANE/TLSA records** (optional) for additional certificate binding via DNSSEC
 - **SCITT verification** (optional) for offline-capable trust via signed status tokens and Merkle inclusion receipts
+- **DPoP / Method B** (optional, `scitt`) for application-layer A2A authentication when TLS is terminated at a proxy
 
 Endpoint discovery reads the DNS discovery records of whichever profile the
 agent publishes, probing SVCB first and falling back to `_ans` TXT:
@@ -151,6 +152,7 @@ use ans_verify::{AnsVerifier, CertFingerprint, CertIdentity, VerificationOutcome
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .build()
         .await?;
@@ -187,6 +189,7 @@ use ans_verify::{AnsVerifier, CertFingerprint, CertIdentity, VerificationOutcome
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .build()
         .await?;
@@ -243,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_store = Arc::new(ScittKeyStore::from_c2sp_keys(&root_keys)?);
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .scitt_config(ScittConfig::new()
             .with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
@@ -289,9 +293,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Tier | Meaning |
 |------|---------|
-| `FullScitt` | Status token + receipt both verified |
-| `StatusTokenVerified` | Status token verified, receipt missing or invalid |
+| `FullScitt` | Status token + receipt verified and bound to the same peer |
+| `StatusTokenVerified` | Status token verified, receipt absent |
 | `BadgeOnly` | Traditional badge-based verification |
+
+Present but invalid receipts reject under every policy. `RequireScitt` disables badge fallback but still permits the `StatusTokenVerified` tier; applications requiring an inclusion receipt must require `FullScitt`.
 
 ### Inspect SCITT Artifacts
 
@@ -301,6 +307,47 @@ Use the `inspect_scitt` example to explore real artifacts from a transparency lo
 cargo run -p ans-verify --features scitt --example inspect_scitt -- \
   --tlog https://transparency.ans.godaddy.com \
   --agent-id b8a46f57-5599-4b4d-9a53-0313e5529694
+```
+
+### DPoP / Method B (A2A without mTLS)
+
+Enable with `features = ["scitt"]`. The caller proves possession of its identity certificate with an RFC 9449 DPoP proof (`DPoP` header). The callee binds that proof to the status token's `validIdentityCerts` and the SCITT receipt. Missing status token is a hard reject. Receipts are required by default; waiving their absence never bypasses verification of a supplied receipt.
+
+Every proof carries `ans_content_digest`, including the digest of empty content for a request without a body (ANS-6 §7.13). Use `attach_identity_with_content` to sign a body and `verify_caller_with_content` to defer hashing until the live identity binding succeeds:
+
+```rust
+use ans_verify::{VerifyCallerOptions, attach_identity_with_content, verify_caller_with_content};
+use sha2::{Digest, Sha256};
+
+let body = br#"{"amount":100}"#;
+let proof = attach_identity_with_content(
+    &signer, "POST", "https://payments.example.com/api/task", None, body,
+)?;
+let identity = verify_caller_with_content(
+    &proof,
+    &headers,
+    "POST",
+    "https://payments.example.com/api/task",
+    &key_store,
+    &replay,
+    VerifyCallerOptions::default().with_trusted_authority("payments.example.com"),
+    || async {
+        // For streamed input, enforce a size limit and read deadline here.
+        // Hash after removing transfer framing, before decoding content.
+        Ok(Sha256::digest(body).into())
+    },
+)
+.await?;
+```
+
+For empty content, use `attach_identity` and `verify_caller` with default content options. Both caller-verification APIs record `jti` after identity and content binding; `verify_proof` establishes possession only and cannot authenticate an ANS agent by itself. Revision `1` is the only supported profile; an absent `ans_profile` selects it, and malformed or unsupported revisions reject.
+
+The HTTP adapter must reject duplicate security headers before extracting values, reconstruct the public URL from a trusted authority and the actual request path, and enforce body limits before hashing. Hash content with its content coding still applied: gzip bytes remain compressed. Complete verification before acting on the content, and share replay storage across replicas serving the same authority. Use `with_artifact_cache` to reuse verified status tokens and receipts.
+
+Run both sides of the flow locally with the self-contained example:
+
+```bash
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
 ```
 
 ## Configuration
@@ -317,6 +364,7 @@ let verifier = AnsVerifier::builder()
         max_entries: 1000,
         default_ttl: Duration::from_secs(300),
         refresh_threshold: Duration::from_secs(60),
+        ..CacheConfig::default()
     })
 
     // Set failure policy
@@ -335,7 +383,7 @@ let verifier = AnsVerifier::builder()
     // Or: .with_dane_if_present()  // Shorthand for ValidateIfPresent
     .dane_port(443)  // Port for TLSA lookup (default: 443)
 
-    // Trusted RA domains (optional, defense-in-depth)
+    // Trusted TL hosts configured out of band (required for ANS-6 badge verification)
     .trusted_ra_domains(["tlog.example.com", "tlog2.example.com"])
 
     .build()
@@ -363,6 +411,7 @@ DANE binds certificates to DNS names via TLSA records, providing additional veri
 
 ```rust
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     // Use Cloudflare DNS
     .dns_cloudflare()
 
@@ -489,6 +538,7 @@ let tlog_client = Arc::new(
 );
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["tlog.example.com"])
     .dns_resolver(dns_resolver)
     .tlog_client(tlog_client)
     .with_dane_if_present()
@@ -545,6 +595,7 @@ use std::sync::Arc;
 
 // Pre-fetch the badge to get expected fingerprint
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     .dane_policy(DanePolicy::ValidateIfPresent)
     .with_caching()
     .build()
@@ -578,7 +629,11 @@ let server_config = rustls::ServerConfig::builder()
     .with_single_cert(server_certs, server_key)?;
 
 // After TLS handshake, verify client against badge
-let verifier = AnsVerifier::builder().with_caching().build().await?;
+let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
+    .with_caching()
+    .build()
+    .await?;
 
 // Extract client cert identity from the TLS connection
 let cert_identity = CertIdentity::from_der(client_cert_der)?;

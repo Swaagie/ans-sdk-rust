@@ -21,16 +21,14 @@ use std::collections::BTreeMap;
 
 use ans_types::{BadgeStatus, CertEntry, CertFingerprint, CertType, StatusTokenPayload};
 use p256::ecdsa::Signature;
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 use uuid::Uuid;
 
-use super::cose::{compute_sig_structure_digest, parse_cose_sign1};
+use super::cose::{build_sig_structure, parse_cose_sign1};
 use super::error::ScittError;
 use super::root_keys::ScittKeyStore;
 
-/// Maximum clock skew tolerance (24 hours). Larger values would make tokens
-/// effectively non-expirable.
-const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
+/// Maximum status-token clock skew (10 minutes), per ANS-6 §4.4.
+pub const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 10 * 60;
 
 /// A status token whose COSE signature has been verified and expiry checked.
 #[derive(Debug, Clone)]
@@ -44,8 +42,9 @@ pub struct VerifiedStatusToken {
 
 /// Verify a SCITT status token: COSE signature + expiry + status check.
 ///
-/// Uses the system clock for expiry checks. See [`verify_status_token_at`]
-/// for a variant that accepts an explicit timestamp (useful in tests).
+/// Uses the system clock for expiry checks. See
+/// [`verify_status_token_at`](crate::verify_status_token_at) for a variant
+/// that accepts an explicit timestamp (useful in tests).
 ///
 /// # Steps
 /// 1. Parse `COSE_Sign1` structure
@@ -89,7 +88,7 @@ pub fn verify_status_token_at(
     let parsed = parse_cose_sign1(token_bytes)?;
 
     // Step 2: verify ECDSA P-256 signature
-    let digest = compute_sig_structure_digest(&parsed.protected_bytes, &parsed.payload)?;
+    let sig_structure = build_sig_structure(&parsed.protected_bytes, &parsed.payload)?;
     let kid_hex = hex::encode(parsed.protected.kid);
     let sig = Signature::from_slice(&parsed.signature).map_err(|_| {
         tracing::warn!(kid = %kid_hex, "ECDSA signature encoding invalid");
@@ -99,10 +98,10 @@ pub fn verify_status_token_at(
     })?;
     let trusted_key = key_store.get(parsed.protected.kid)?;
     tracing::debug!(kid = %kid_hex, key_domain = %trusted_key.name, "Key lookup succeeded");
-    trusted_key.key.verify_prehash(&digest, &sig).map_err(|_| {
+    if !crate::p256_verify::verify_p256_sha256(&trusted_key.key, &sig_structure, &sig) {
         tracing::warn!(kid = %kid_hex, "ECDSA signature verification failed");
-        ScittError::SignatureInvalid
-    })?;
+        return Err(ScittError::SignatureInvalid);
+    }
     tracing::debug!(kid = %kid_hex, "ECDSA signature verified");
 
     // Step 2b: bind iss claim to signing key domain (mirrors receipt.rs)
@@ -327,14 +326,21 @@ fn parse_cert_entries(arr: Vec<ciborium::Value>) -> Result<Vec<CertEntry>, Scitt
                 || matches!(&k, ciborium::Value::Text(s) if s == "cert_type");
 
             if is_fingerprint {
-                if let ciborium::Value::Text(fp_str) = v {
-                    fingerprint =
+                fingerprint = match v {
+                    ciborium::Value::Text(fp_str) => {
                         Some(CertFingerprint::parse(&fp_str).map_err(|e| {
                             ScittError::CborDecodeError(format!("fingerprint: {e}"))
-                        })?);
-                }
+                        })?)
+                    }
+                    ciborium::Value::Bytes(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        Some(CertFingerprint::from_bytes(arr))
+                    }
+                    _ => None,
+                };
             } else if is_cert_type && let ciborium::Value::Text(t) = v {
-                cert_type = Some(t.parse::<CertType>().map_err(ScittError::CborDecodeError)?);
+                cert_type = Some(CertType::from(t));
             }
         }
 
@@ -361,11 +367,14 @@ fn cbor_to_i64(v: &ciborium::Value) -> Option<i64> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner as _};
     use p256::pkcs8::EncodePublicKey as _;
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::scitt::cose::compute_sig_structure_digest;
     use crate::scitt::root_keys::ScittKeyStore;
 
     use base64::Engine as _;
@@ -552,6 +561,67 @@ mod tests {
     }
 
     // ── Valid token tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn signed_tokens_match_fingerprints_independently_of_certificate_type() {
+        let (key, store) = make_key_and_store(1);
+        let fingerprint = CertFingerprint::parse(&test_fp()).unwrap();
+        for label in [
+            "X509-DV-SERVER",
+            "X509-OV-CLIENT",
+            "X509-OV-SERVER",
+            "X509-EV-CLIENT",
+            "x509-ev-server",
+            "Future-Certificate",
+        ] {
+            let certs = [(test_fp(), label.to_owned())];
+            let payload = build_cbor_payload(
+                &nil_uuid(),
+                "ACTIVE",
+                1,
+                future_exp(),
+                "ans://v1.0.0.agent.example.com",
+                &certs,
+                &certs,
+                &[],
+            );
+            let verified =
+                verify_status_token_at(&make_token(&key, &payload), &store, Duration::ZERO, 100)
+                    .unwrap();
+            assert!(
+                matches_identity_cert(&verified.payload, &fingerprint),
+                "{label}"
+            );
+            assert!(
+                matches_server_cert(&verified.payload, &fingerprint),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_tokens_reject_badge_only_and_unrecognized_statuses() {
+        let (key, store) = make_key_and_store(1);
+        for status in ["UNKNOWN", "FUTURE_TERMINAL_STATUS"] {
+            let payload = build_cbor_payload(
+                &nil_uuid(),
+                status,
+                1,
+                future_exp(),
+                "ans://v1.0.0.agent.example.com",
+                &[],
+                &[],
+                &[],
+            );
+            let error =
+                verify_status_token_at(&make_token(&key, &payload), &store, Duration::ZERO, 100)
+                    .unwrap_err();
+            assert!(
+                matches!(error, ScittError::CborDecodeError(_)),
+                "{status}: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn valid_active_token() {

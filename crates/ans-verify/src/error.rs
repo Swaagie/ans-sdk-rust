@@ -82,6 +82,13 @@ pub enum DnsError {
     ResolverError(String),
 }
 
+impl DnsError {
+    /// Only lookup outages can justify reuse of previously verified evidence.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::LookupFailed { .. } | Self::Timeout { .. })
+    }
+}
+
 /// HTTP transport error wrapper.
 ///
 /// Wraps the underlying HTTP client error to avoid exposing third-party
@@ -113,7 +120,7 @@ impl From<reqwest::Error> for HttpError {
 ///
 /// These errors map to HTTP responses from the TL API:
 /// - 404 → `NotFound`
-/// - 5xx → `ServiceUnavailable`
+/// - 429 or 5xx → `ServiceUnavailable`
 /// - Parse failures → `InvalidResponse`
 /// - Network/HTTP errors → `HttpError`
 #[derive(Debug, Error)]
@@ -134,9 +141,13 @@ pub enum TlogError {
     #[error("Invalid badge response: {0}")]
     InvalidResponse(String),
 
-    /// Service unavailable (HTTP 5xx)
+    /// Service unavailable or rate limited (HTTP 5xx or 429)
     #[error("Transparency log service unavailable")]
     ServiceUnavailable,
+
+    /// The TL returned the badge-only UNKNOWN status (ANS-6 §4.1).
+    #[error("Transparency log cannot determine the agent's current status")]
+    StatusUnknown,
 
     /// Invalid URL construction
     #[error("Invalid URL: {0}")]
@@ -154,6 +165,16 @@ pub enum TlogError {
         /// The list of trusted domains.
         trusted: Vec<String>,
     },
+}
+
+impl TlogError {
+    /// Malformed, missing, or untrusted evidence is not a transport outage.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::HttpError(_) | Self::ServiceUnavailable | Self::StatusUnknown
+        )
+    }
 }
 
 /// Verification logic errors.

@@ -19,6 +19,9 @@ pub enum BadgeStatus {
     Expired,
     /// Registration has been explicitly revoked.
     Revoked,
+    /// The TL cannot determine current status. Badge-only; apply the verifier's
+    /// failure policy instead of treating this as a successful status.
+    Unknown,
 }
 
 impl BadgeStatus {
@@ -32,7 +35,9 @@ impl BadgeStatus {
         matches!(self, Self::Active | Self::Warning)
     }
 
-    /// Check if this status indicates the badge should be rejected.
+    /// Check if this is a determinate terminal status.
+    ///
+    /// `Unknown` is not terminal, but is also never valid for a connection.
     pub fn should_reject(&self) -> bool {
         matches!(self, Self::Expired | Self::Revoked)
     }
@@ -40,19 +45,50 @@ impl BadgeStatus {
 
 /// Event types for badge events.
 ///
-/// These match the TL API swagger spec eventType enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Known values match the TL API schema. Unfamiliar informational event labels
+/// are preserved; live authentication depends on the badge status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 #[non_exhaustive]
 pub enum EventType {
     /// Agent was initially registered.
     AgentRegistered,
     /// Agent certificates were renewed.
     AgentRenewed,
+    /// Agent registration was updated.
+    AgentUpdated,
     /// AHP has marked this version for retirement.
     AgentDeprecated,
     /// Agent registration was revoked.
     AgentRevoked,
+    /// An event label introduced after this SDK version.
+    Other(String),
+}
+
+impl From<String> for EventType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "AGENT_REGISTERED" => Self::AgentRegistered,
+            "AGENT_RENEWED" => Self::AgentRenewed,
+            "AGENT_UPDATED" => Self::AgentUpdated,
+            "AGENT_DEPRECATED" => Self::AgentDeprecated,
+            "AGENT_REVOKED" => Self::AgentRevoked,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<EventType> for String {
+    fn from(value: EventType) -> Self {
+        match value {
+            EventType::AgentRegistered => "AGENT_REGISTERED".into(),
+            EventType::AgentRenewed => "AGENT_RENEWED".into(),
+            EventType::AgentUpdated => "AGENT_UPDATED".into(),
+            EventType::AgentDeprecated => "AGENT_DEPRECATED".into(),
+            EventType::AgentRevoked => "AGENT_REVOKED".into(),
+            EventType::Other(value) => value,
+        }
+    }
 }
 
 /// Full badge response from the Transparency Log API.
@@ -64,7 +100,7 @@ pub struct Badge {
     pub status: BadgeStatus,
     /// Badge payload containing the signed event.
     pub payload: BadgePayload,
-    /// Schema version (e.g., "V1").
+    /// Schema version (`V1` or `V2`).
     pub schema_version: String,
     /// Signature over the badge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,26 +126,58 @@ impl Badge {
         &self.payload.producer.event.agent.version
     }
 
-    /// Get the server certificate fingerprint.
+    /// Get the first server certificate fingerprint, or `""` if absent.
+    ///
+    /// Use [`Self::server_cert_fingerprints`] for verification: rotations
+    /// can publish more than one certificate.
     pub fn server_cert_fingerprint(&self) -> &str {
-        &self
-            .payload
-            .producer
-            .event
-            .attestations
-            .server_cert
-            .fingerprint
+        self.server_cert_fingerprints().next().unwrap_or("")
     }
 
-    /// Get the identity certificate fingerprint.
+    /// Get the first identity certificate fingerprint, or `""` if absent.
+    ///
+    /// Use [`Self::identity_cert_fingerprints`] for verification.
     pub fn identity_cert_fingerprint(&self) -> &str {
-        &self
-            .payload
-            .producer
-            .event
-            .attestations
-            .identity_cert
-            .fingerprint
+        self.identity_cert_fingerprints().next().unwrap_or("")
+    }
+
+    /// All server certificate fingerprints for this badge's schema.
+    pub fn server_cert_fingerprints(&self) -> impl Iterator<Item = &str> {
+        let attestations = &self.payload.producer.event.attestations;
+        self.cert_fingerprints(
+            &attestations.server_certs,
+            attestations.server_cert.as_ref(),
+        )
+    }
+
+    /// All identity certificate fingerprints for this badge's schema.
+    ///
+    /// Registrations without an Identity Certificate yield no entries.
+    pub fn identity_cert_fingerprints(&self) -> impl Iterator<Item = &str> {
+        let attestations = &self.payload.producer.event.attestations;
+        self.cert_fingerprints(
+            &attestations.identity_certs,
+            attestations.identity_cert.as_ref(),
+        )
+    }
+
+    fn cert_fingerprints<'a>(
+        &'a self,
+        certificates: &'a [CertAttestation],
+        legacy: Option<&'a CertAttestation>,
+    ) -> impl Iterator<Item = &'a str> {
+        // V2 uses only arrays: a stale singular field must not restore a
+        // certificate missing from the current array. Unknown schemas fail
+        // closed instead of inheriting V1 semantics.
+        let (certificates, legacy) = match self.schema_version.as_str() {
+            "V1" if certificates.is_empty() => (certificates, legacy),
+            "V1" | "V2" => (certificates, None),
+            _ => (&[][..], None),
+        };
+        certificates
+            .iter()
+            .chain(legacy)
+            .map(|cert| cert.fingerprint.as_str())
     }
 
     /// Get the agent ID (UUID).
@@ -119,7 +187,7 @@ impl Badge {
 
     /// Get the event type.
     pub fn event_type(&self) -> EventType {
-        self.payload.producer.event.event_type
+        self.payload.producer.event.event_type.clone()
     }
 
     /// Check if this badge is valid for connections.
@@ -167,8 +235,9 @@ pub struct AgentEvent {
     pub agent: AgentInfo,
     /// Certificate attestations.
     pub attestations: Attestations,
-    /// When this registration expires.
-    pub expires_at: DateTime<Utc>,
+    /// When this registration expires, if present in the sealed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     /// When this registration was issued.
     pub issued_at: DateTime<Utc>,
     /// Registration Authority ID.
@@ -184,6 +253,7 @@ pub struct AgentInfo {
     /// Agent's host FQDN.
     pub host: String,
     /// Human-readable agent name.
+    #[serde(default)]
     pub name: String,
     /// Agent version string.
     pub version: String,
@@ -194,12 +264,21 @@ pub struct AgentInfo {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Attestations {
-    /// Domain validation method used.
-    pub domain_validation: String,
-    /// Identity certificate attestation.
-    pub identity_cert: CertAttestation,
-    /// Server certificate attestation.
-    pub server_cert: CertAttestation,
+    /// Domain validation method, when this event includes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_validation: Option<String>,
+    /// Legacy V1 identity certificate, absent for server-only registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_cert: Option<CertAttestation>,
+    /// Legacy V1 server certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert: Option<CertAttestation>,
+    /// V2 identity certificates, including the rotation overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_certs: Vec<CertAttestation>,
+    /// V2 server certificates, including the rotation overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_certs: Vec<CertAttestation>,
 }
 
 /// Certificate attestation with fingerprint and type.
@@ -246,6 +325,7 @@ mod tests {
         assert!(BadgeStatus::Deprecated.is_valid_for_connection());
         assert!(!BadgeStatus::Expired.is_valid_for_connection());
         assert!(!BadgeStatus::Revoked.is_valid_for_connection());
+        assert!(!BadgeStatus::Unknown.is_valid_for_connection());
     }
 
     #[test]
@@ -255,6 +335,24 @@ mod tests {
         assert!(!BadgeStatus::Deprecated.should_reject());
         assert!(BadgeStatus::Expired.should_reject());
         assert!(BadgeStatus::Revoked.should_reject());
+        assert!(!BadgeStatus::Unknown.should_reject());
+    }
+
+    #[test]
+    fn unknown_status_is_distinct_from_unrecognized_status() {
+        assert_eq!(
+            serde_json::from_str::<BadgeStatus>("\"UNKNOWN\"").unwrap(),
+            BadgeStatus::Unknown
+        );
+        assert!(serde_json::from_str::<BadgeStatus>("\"FUTURE_TERMINAL_STATUS\"").is_err());
+    }
+
+    #[test]
+    fn unfamiliar_event_type_round_trips() {
+        let json = "\"AGENT_FUTURE_EVENT\"";
+        let event: EventType = serde_json::from_str(json).unwrap();
+        assert_eq!(event, EventType::Other("AGENT_FUTURE_EVENT".into()));
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
     }
 
     #[test]
