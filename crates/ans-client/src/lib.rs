@@ -71,7 +71,7 @@
 //! 5. Call `verify_dns()` to complete registration
 //!
 //! ```rust,no_run
-//! # use ans_client::{AnsClient, AnsCsrBuilder, models::*};
+//! # use ans_client::{AnsClient, AnsCsrBuilder, Fqdn, Version, models::*};
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = AnsClient::builder()
 //!     .base_url("https://api.godaddy.com")
@@ -79,9 +79,12 @@
 //!     .build()?;
 //!
 //! // Step 1: Generate CSRs with correct extensions and RSA-2048 keys
-//! let server = AnsCsrBuilder::server("agent.example.com", "1.0.0").build()?;
-//! let identity = AnsCsrBuilder::identity("agent.example.com", "1.0.0").build()?;
+//! let host = Fqdn::new("agent.example.com")?;
+//! let version = Version::parse("1.0.0")?;
+//! let server = AnsCsrBuilder::server(host.clone(), version.clone()).build()?;
+//! let identity = AnsCsrBuilder::identity(host, version).build()?;
 //! // store server.private_key_pem and identity.private_key_pem securely
+//! // (both are `SecretString` — call `expose_secret()` to persist them)
 //!
 //! // Step 2: Register
 //! let endpoint = AgentEndpoint::new("https://agent.example.com/mcp", Protocol::Mcp)
@@ -120,4 +123,4 @@ pub use csr::{AnsCsrBuilder, CsrOutput};
 pub use error::{ClientError, HttpError, Result};
 
 // Re-export types from ans-types for convenience
-pub use ans_types::{Fqdn, Version};
+pub use ans_types::{AnsName, Fqdn, Version};
