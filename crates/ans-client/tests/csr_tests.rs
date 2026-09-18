@@ -4,11 +4,8 @@
     clippy::panic,
     clippy::items_after_test_module
 )]
-//! Tests for [`AnsCsrBuilder`].
-//!
-//! Each test parses the generated CSR with `x509-parser` to verify that
-//! Subject CN, SANs, Extended Key Usage, and Key Usage extensions are exactly
-//! what the ANS PKI requires.
+//! Tests for [`AnsCsrBuilder`], asserting against the generated DER rather
+//! than the builder's inputs.
 
 use ans_client::csr::AnsCsrBuilder;
 use ans_client::{AnsName, Fqdn, Version};
@@ -38,14 +35,11 @@ fn identity_csr(host: &str, v: &str) -> ans_client::CsrOutput {
         .expect("identity CSR should build")
 }
 
-/// Decode a PEM-encoded CSR to its raw DER bytes.
 fn pem_to_der(pem: &str) -> Vec<u8> {
     let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).expect("PEM decode failed");
     pem_obj.contents
 }
 
-/// Run `f` over every requested extension of the CSR, returning the first
-/// `Some` result.
 fn find_extension<T>(csr_pem: &str, f: impl FnMut(&ParsedExtension<'_>) -> Option<T>) -> Option<T> {
     let der = pem_to_der(csr_pem);
     let (_, csr) = X509CertificationRequest::from_der(&der).expect("CSR parse failed");
@@ -53,7 +47,6 @@ fn find_extension<T>(csr_pem: &str, f: impl FnMut(&ParsedExtension<'_>) -> Optio
         .and_then(|mut exts| exts.find_map(f))
 }
 
-/// Every `GeneralName` in the CSR's Subject Alternative Name extension.
 fn subject_alt_names(csr_pem: &str) -> Vec<String> {
     find_extension(csr_pem, |ext| match ext {
         ParsedExtension::SubjectAlternativeName(san) => Some(
@@ -88,17 +81,18 @@ fn eku(csr_pem: &str) -> (bool, bool) {
     .expect("ExtendedKeyUsage extension must be present")
 }
 
-fn common_name(csr_pem: &str) -> String {
+fn common_name(csr_pem: &str) -> Option<String> {
     let der = pem_to_der(csr_pem);
     let (_, csr) = X509CertificationRequest::from_der(&der).expect("CSR parse failed");
     csr.certification_request_info
         .subject
         .iter_common_name()
         .next()
-        .expect("subject must contain a CN")
-        .as_str()
-        .expect("CN must be a printable string")
-        .to_string()
+        .map(|cn| {
+            cn.as_str()
+                .expect("CN must be a printable string")
+                .to_string()
+        })
 }
 
 fn rsa_key_size(csr_pem: &str) -> usize {
@@ -112,16 +106,44 @@ fn rsa_key_size(csr_pem: &str) -> usize {
 
 // ── Subject CN ────────────────────────────────────────────────────────────────
 
+/// Deprecated and unread: public CAs and the RA both match the DNS SAN, and a
+/// CN over RFC 5280's 64-character bound is dropped rather than honoured.
 #[test]
-fn server_csr_cn_equals_hostname() {
+fn server_csr_omits_common_name() {
     let out = server_csr("agent.example.com", "1.2.3");
-    assert_eq!(common_name(&out.csr_pem), "agent.example.com");
+    assert_eq!(
+        common_name(&out.csr_pem),
+        None,
+        "server CSR must not carry a subject CN"
+    );
 }
 
+/// Load-bearing: the ANS private CA copies this subject and adds no DNS SAN,
+/// so dropping the CN would strip the identity cert's only FQDN carrier.
 #[test]
 fn identity_csr_cn_equals_hostname() {
     let out = identity_csr("id.example.ai", "0.9.1");
-    assert_eq!(common_name(&out.csr_pem), "id.example.ai");
+    assert_eq!(common_name(&out.csr_pem), Some("id.example.ai".to_string()));
+}
+
+/// A host too long for a conformant CN must still yield a usable server CSR,
+/// with the name carried by the SAN rather than truncated into the subject.
+#[test]
+fn server_csr_with_long_host_omits_cn_and_still_builds() {
+    let host = format!(
+        "{}.{}.{}.example.com",
+        "a".repeat(60),
+        "b".repeat(60),
+        "c".repeat(60)
+    );
+    assert!(
+        host.len() > 64,
+        "test host must exceed the 64-char CN limit"
+    );
+
+    let out = server_csr(&host, "1.0.0");
+    assert_eq!(common_name(&out.csr_pem), None);
+    assert_eq!(subject_alt_names(&out.csr_pem), vec![format!("DNS:{host}")]);
 }
 
 // ── SANs ──────────────────────────────────────────────────────────────────────
@@ -144,9 +166,8 @@ fn identity_csr_san_contains_dns_hostname() {
     );
 }
 
-/// The public Server Certificate is bound by DNS name only (ANS-2 §3). A URI
-/// SAN in the request is also fatal at public CAs — Boulder's `VerifyCSR`
-/// rejects it outright, and the ANS ACME issuer forwards the CSR unchanged.
+/// A URI SAN here is fatal: the RA forwards this CSR to a public CA unchanged,
+/// and public CAs reject requests carrying one.
 #[rstest]
 #[case("example.ai", "1.0.0")]
 #[case("my-agent.example.com", "0.1.2")]
@@ -166,8 +187,7 @@ fn server_csr_has_no_uri_san(#[case] host: &str, #[case] v: &str) {
     );
 }
 
-/// The URI SAN must be `ans://v{version}.{host}` so that the ANS verifier can
-/// extract the version and FQDN from the mTLS identity certificate.
+/// The verifier recovers both version and FQDN from this SAN alone.
 #[rstest]
 #[case("example.ai", "1.0.0", "ans://v1.0.0.example.ai")]
 #[case("id.svc.com", "2.3.4", "ans://v2.3.4.id.svc.com")]
@@ -189,8 +209,8 @@ fn identity_csr_san_uri_is_ans_format(
     AnsName::parse(expected_uri).expect("generated URI SAN must round-trip through AnsName");
 }
 
-/// `Version` renders with its own `v` prefix (`v1.2.3`). The builder must not
-/// add a second one — `ans://vv1.2.3.…` is rejected by `AnsName::parse`.
+/// `Version` already renders its own `v` prefix, so a second one would yield
+/// `ans://vv1.2.3.…`.
 #[test]
 fn identity_csr_uri_san_does_not_double_prefix_version() {
     let out = AnsCsrBuilder::identity(fqdn("agent.example.com"), Version::new(1, 2, 3))
@@ -210,8 +230,7 @@ fn identity_csr_uri_san_does_not_double_prefix_version() {
     assert_eq!(parsed.fqdn().as_str(), "agent.example.com");
 }
 
-/// `Version::parse` accepts both `1.2.3` and `v1.2.3`; either spelling must
-/// produce the same canonical URI SAN.
+/// `Version::parse` takes both `1.2.3` and `v1.2.3`; the SAN must not differ.
 #[test]
 fn identity_csr_uri_san_is_independent_of_version_spelling() {
     let bare = identity_csr("agent.example.com", "1.2.3");
@@ -225,8 +244,7 @@ fn identity_csr_uri_san_is_independent_of_version_spelling() {
 
 // ── Input validation ──────────────────────────────────────────────────────────
 
-/// The builder takes validated `Fqdn` / `Version` values, so malformed input is
-/// rejected before a key pair is ever generated.
+/// Malformed input is unrepresentable, so it never reaches key generation.
 #[rstest]
 #[case::empty("")]
 #[case::space("bad host")]
@@ -254,13 +272,16 @@ fn invalid_versions_are_rejected(#[case] v: &str) {
     assert!(Version::parse(v).is_err(), "{v:?} must not parse");
 }
 
-/// `Fqdn` normalizes case, so the CN, DNS SAN and URI SAN all use the
-/// lowercase form regardless of how the caller spelled the host.
+/// `Fqdn` lowercases, so caller spelling must not leak into any of the three
+/// name fields.
 #[test]
 fn host_is_normalized_to_lowercase() {
     let out = identity_csr("Agent.Example.COM", "1.0.0");
 
-    assert_eq!(common_name(&out.csr_pem), "agent.example.com");
+    assert_eq!(
+        common_name(&out.csr_pem),
+        Some("agent.example.com".to_string())
+    );
     assert_eq!(
         subject_alt_names(&out.csr_pem),
         vec![
@@ -272,8 +293,7 @@ fn host_is_normalized_to_lowercase() {
 
 // ── Extended Key Usage ────────────────────────────────────────────────────────
 
-/// Server CSRs must request `id-kp-serverAuth` (OID 1.3.6.1.5.5.7.3.1).
-/// Submitting a CSR with `clientAuth` would result in a 422 from the ANS API.
+/// The wrong EKU here is a 422 from the RA, not a local error.
 #[test]
 fn server_csr_has_server_auth_eku_only() {
     let out = server_csr("agent.example.com", "1.0.0");
@@ -294,8 +314,7 @@ fn identity_csr_has_client_auth_eku_only() {
 
 // ── Key Usage ─────────────────────────────────────────────────────────────────
 
-/// Server certificates are used for TLS and need both `digitalSignature` (for
-/// TLS 1.3 handshakes) and `keyEncipherment` (for RSA key exchange in TLS 1.2).
+/// `keyEncipherment` is required for TLS 1.2 RSA key exchange, not just 1.3.
 #[test]
 fn server_csr_key_usage_digital_signature_and_key_encipherment() {
     let out = server_csr("agent.example.com", "1.0.0");
@@ -309,7 +328,6 @@ fn server_csr_key_usage_digital_signature_and_key_encipherment() {
         ku.key_encipherment(),
         "server CSR must request KeyEncipherment"
     );
-    // Sanity: bits that must NOT be set
     assert!(
         !ku.key_agreement(),
         "server CSR must not request KeyAgreement"
@@ -320,8 +338,7 @@ fn server_csr_key_usage_digital_signature_and_key_encipherment() {
     );
 }
 
-/// Identity (mTLS client) certificates only need `digitalSignature`; they are
-/// never used for key exchange, so `keyEncipherment` must be absent.
+/// Identity certs never do key exchange, so `keyEncipherment` must be absent.
 #[test]
 fn identity_csr_key_usage_digital_signature_only() {
     let out = identity_csr("agent.example.com", "1.0.0");
@@ -343,11 +360,8 @@ fn identity_csr_key_usage_digital_signature_only() {
 
 // ── RSA-2048 key ──────────────────────────────────────────────────────────────
 
-/// ANS PKI only accepts RSA-2048 keys; ECDSA keys lead to indefinite
-/// `PENDING_CERTS` stalls with no error indication.
-///
-/// The key size is checked via the public key embedded in the CSR itself
-/// (`SubjectPublicKeyInfo`), so no separate key-parsing dependency is needed.
+/// Pins the default against drifting below the RA's 2048-bit floor; the RA
+/// itself also accepts larger RSA and ECDSA P-256/P-384.
 #[test]
 fn server_csr_embeds_rsa_2048_public_key() {
     assert_eq!(
@@ -364,8 +378,7 @@ fn identity_csr_embeds_rsa_2048_public_key() {
     );
 }
 
-/// Private key output must be in PKCS#8 PEM format so that it can be loaded
-/// directly by TLS stacks (rustls, openssl) and other tools without conversion.
+/// PKCS#8 loads into rustls and openssl without conversion; PKCS#1 does not.
 #[rstest]
 #[case::server(server_csr("agent.example.com", "1.0.0"))]
 #[case::identity(identity_csr("agent.example.com", "1.0.0"))]
@@ -380,8 +393,7 @@ fn private_key_pem_is_pkcs8(#[case] out: ans_client::CsrOutput) {
 
 // ── Secret handling ───────────────────────────────────────────────────────────
 
-/// `CsrOutput` is routinely passed to `tracing::debug!(?output)`. The private
-/// key must never appear in diagnostic output.
+/// `CsrOutput` reaches `tracing::debug!(?output)` on ordinary paths.
 #[rstest]
 #[case::server(server_csr("agent.example.com", "1.0.0"))]
 #[case::identity(identity_csr("agent.example.com", "1.0.0"))]
@@ -409,8 +421,7 @@ fn debug_output_redacts_private_key(#[case] out: ans_client::CsrOutput) {
 
 // ── Uniqueness ────────────────────────────────────────────────────────────────
 
-/// Each call to `build()` must generate a fresh key pair so that two agents
-/// running the same code never share a private key.
+/// Two agents running identical code must not end up sharing a private key.
 #[test]
 fn two_server_csrs_differ() {
     let a = server_csr("agent.example.com", "1.0.0");

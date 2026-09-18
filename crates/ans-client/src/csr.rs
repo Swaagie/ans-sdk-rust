@@ -1,27 +1,34 @@
 //! CSR builder for ANS agent registration.
 //!
-//! Generates correctly-configured Certificate Signing Requests for both ANS
-//! certificate types. Handles key generation and sets all required extensions
-//! so callers cannot accidentally submit an invalid CSR.
+//! Generates Certificate Signing Requests for both ANS certificate types,
+//! including key generation and every extension the RA requires.
 //!
 //! ## Key algorithm
 //!
-//! This helper currently generates **RSA-2048** keys for both the TLS server
-//! certificate and the mTLS identity certificate — the only algorithm the ANS
-//! PKI issues for. ECDSA (P-256) generation for ANS-6 Method B is planned as a
-//! follow-up; until then a P-256 request must be built by hand.
+//! RSA-2048 is this SDK's default, not a PKI limit — the RA also accepts
+//! larger RSA and ECDSA P-256/P-384.
 //!
 //! ## Requirements enforced automatically
 //!
-//! | Certificate | EKU          | Key Usage                             | SANs         |
-//! |-------------|--------------|---------------------------------------|--------------|
-//! | Server      | `ServerAuth` | `DigitalSignature`, `KeyEncipherment` | DNS          |
-//! | Identity    | `ClientAuth` | `DigitalSignature`                    | DNS + ANS URI|
+//! | Certificate | Subject CN | EKU          | Key Usage                             | SANs          |
+//! |-------------|------------|--------------|---------------------------------------|---------------|
+//! | Server      | *omitted*  | `ServerAuth` | `DigitalSignature`, `KeyEncipherment` | DNS           |
+//! | Identity    | FQDN       | `ClientAuth` | `DigitalSignature`                    | DNS + ANS URI |
 //!
-//! The versioned ANS URI SAN belongs to the private Identity Certificate
-//! (ANS-2 §3); the public Server Certificate is bound by DNS name alone.
-//! Public CAs reject requests carrying a URI SAN — Boulder's `VerifyCSR` in
-//! particular — so a server CSR must not contain one.
+//! The URI SAN is identity-only: public CAs reject a server CSR that carries
+//! one, and ANS-2 §3 assigns that binding to the Identity Certificate.
+//!
+//! ## Subject Common Name
+//!
+//! The server CSR omits the CN. It is deprecated and optional for public CAs,
+//! which read the DNS SAN instead and silently drop a CN over RFC 5280's
+//! 64-character `ub-common-name`, so setting it buys nothing and makes the
+//! request depend on per-CA handling of an over-length field.
+//!
+//! The identity CSR keeps it. The ANS private CA copies the CSR subject and
+//! adds no DNS SAN, leaving the CN as the identity certificate's only FQDN
+//! carrier for mTLS verification, so a host over 64 characters cannot yield a
+//! conformant identity certificate.
 //!
 //! ## Example
 //!
@@ -50,17 +57,15 @@ use rcgen::{
 use secrecy::SecretString;
 use thiserror::Error;
 
-/// The output of a successful [`AnsCsrBuilder::build`] call.
+/// A generated CSR and the private key it was signed with.
 ///
-/// The private key is held in a [`SecretString`], so it is redacted from
-/// `Debug` output and zeroized on drop. Call `expose_secret()` when you are
-/// ready to persist it.
+/// The key is redacted from `Debug` and zeroized on drop; call
+/// `expose_secret()` to persist it.
 #[derive(Debug, Clone)]
 pub struct CsrOutput {
     /// PEM-encoded Certificate Signing Request ready for submission to ANS.
     pub csr_pem: String,
-    /// PKCS#8 PEM-encoded RSA-2048 private key. Store this securely — it never
-    /// leaves the process on its own.
+    /// PKCS#8 PEM private key, never transmitted by this crate.
     pub private_key_pem: SecretString,
 }
 
@@ -89,12 +94,9 @@ enum CsrKind {
 
 /// Builder for ANS-compliant Certificate Signing Requests.
 ///
-/// Use [`AnsCsrBuilder::server`] for the TLS server certificate CSR and
-/// [`AnsCsrBuilder::identity`] for the mTLS client identity certificate CSR.
-///
-/// Both take the validated domain types [`Fqdn`] and [`Version`], so a builder
-/// cannot be constructed from a malformed hostname or version string. Parse
-/// untrusted input with [`Fqdn::new`] and [`Version::parse`] first.
+/// Taking [`Fqdn`] and [`Version`] rather than strings makes a malformed host
+/// or version unrepresentable; parse untrusted input with [`Fqdn::new`] and
+/// [`Version::parse`] first.
 #[derive(Debug)]
 pub struct AnsCsrBuilder {
     host: Fqdn,
@@ -104,9 +106,7 @@ pub struct AnsCsrBuilder {
 
 impl AnsCsrBuilder {
     /// Build a **server** CSR: `ServerAuth` EKU, `DigitalSignature` +
-    /// `KeyEncipherment` key usage, DNS SAN only.
-    ///
-    /// Generates an RSA-2048 key pair when [`build`](Self::build) is called.
+    /// `KeyEncipherment` key usage, DNS SAN only, no subject CN.
     pub fn server(host: Fqdn, version: Version) -> Self {
         Self {
             host,
@@ -116,9 +116,7 @@ impl AnsCsrBuilder {
     }
 
     /// Build an **identity** CSR: `ClientAuth` EKU, `DigitalSignature` key
-    /// usage, DNS SAN plus the versioned `ans://` URI SAN.
-    ///
-    /// Generates an RSA-2048 key pair when [`build`](Self::build) is called.
+    /// usage, DNS SAN plus the versioned `ans://` URI SAN, host as subject CN.
     pub fn identity(host: Fqdn, version: Version) -> Self {
         Self {
             host,
@@ -127,18 +125,14 @@ impl AnsCsrBuilder {
         }
     }
 
-    /// Generate the RSA-2048 key pair and produce the CSR.
-    ///
-    /// The returned [`CsrOutput`] contains the PEM-encoded CSR and the
-    /// corresponding private key. The private key is not transmitted anywhere —
-    /// the caller is responsible for storing it securely.
+    /// Generate a fresh RSA-2048 key pair and produce the CSR.
     ///
     /// # Errors
-    /// Returns [`CsrError::InvalidName`] if the host and version do not form a
-    /// parseable [`AnsName`], and [`CsrError::Serialization`] if key generation
-    /// or CSR encoding fails.
+    /// [`CsrError::InvalidName`] if the host and version do not form a
+    /// parseable [`AnsName`], [`CsrError::Serialization`] if key generation or
+    /// CSR encoding fails.
     pub fn build(self) -> Result<CsrOutput, CsrError> {
-        // Validate the ANS name before spending time on key generation.
+        // Validated before key generation, which is the expensive step.
         let sans = build_sans(&self.host, &self.version, self.kind)?;
 
         let key_pair = generate_rsa_key_pair()?;
@@ -152,24 +146,18 @@ impl AnsCsrBuilder {
 }
 
 fn generate_rsa_key_pair() -> Result<KeyPair, CsrError> {
-    // RSA-2048 key generation via aws-lc-rs (BoringSSL).  The `ring` crate
-    // does not support RSA key generation; the `rsa` pure-Rust crate carries
-    // RUSTSEC-2023-0071 (Marvin Attack timing side-channel in decryption).
+    // aws-lc-rs, because `ring` cannot generate RSA keys at all and the `rsa`
+    // crate carries RUSTSEC-2023-0071 (Marvin timing side-channel).
     KeyPair::generate_for(&PKCS_RSA_SHA256).map_err(CsrError::Serialization)
 }
 
-/// Build the SAN list for `kind`.
-///
-/// Every CSR carries the DNS SAN. Only the identity CSR carries the versioned
-/// ANS URI SAN — public CAs reject requests containing URI SANs, and ANS-2 §3
-/// assigns that binding to the Identity Certificate.
 fn build_sans(host: &Fqdn, version: &Version, kind: CsrKind) -> Result<Vec<SanType>, CsrError> {
     let dns_san = ia5(host.as_str())?;
     let mut sans = vec![SanType::DnsName(dns_san)];
 
     if kind == CsrKind::Identity {
-        // `Version` renders as `v1.2.3` and `Fqdn` is already normalized, so
-        // this is the canonical ANS name. Round-trip it to be certain.
+        // Round-tripped rather than pushed as a string so a malformed name
+        // fails here instead of at the RA.
         let ans_name: AnsName = format!("ans://{version}.{host}").parse()?;
         sans.push(SanType::URI(ia5(&ans_name.to_string())?));
     }
@@ -189,7 +177,11 @@ fn build_csr(
     kind: CsrKind,
 ) -> Result<String, CsrError> {
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, host.as_str());
+    if kind == CsrKind::Identity {
+        // Identity certs get no DNS SAN from the CA, so the CN is their only
+        // FQDN carrier; on the server side it is deprecated and unread.
+        dn.push(DnType::CommonName, host.as_str());
+    }
 
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
