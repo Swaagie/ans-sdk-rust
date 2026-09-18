@@ -53,5 +53,6 @@ rstest = { workspace = true }
 test-log = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
-x509-parser = { workspace = true }
-secrecy = { workspace = true }
+# verify-aws reuses the aws-lc-rs already pulled in by rcgen, so the CSR
+# self-signature can be checked without adding a second crypto backend.
+x509-parser = { workspace = true, features = ["verify-aws"] }

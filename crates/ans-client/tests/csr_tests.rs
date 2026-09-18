@@ -10,7 +10,7 @@
 use ans_client::csr::AnsCsrBuilder;
 use ans_client::{AnsName, Fqdn, Version};
 use rstest::rstest;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use x509_parser::{pem::parse_x509_pem, prelude::*, public_key::PublicKey};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -445,4 +445,109 @@ fn two_identity_csrs_differ() {
         a.private_key_pem.expose_secret(),
         b.private_key_pem.expose_secret()
     );
+}
+
+// ── Key binding ───────────────────────────────────────────────────────────────
+
+/// The CSR is only usable if it was signed by the key it embeds; a CA rejects
+/// it otherwise.
+#[rstest]
+#[case::server(server_csr("agent.example.com", "1.0.0"))]
+#[case::identity(identity_csr("agent.example.com", "1.0.0"))]
+fn csr_self_signature_verifies(#[case] out: ans_client::CsrOutput) {
+    let der = pem_to_der(&out.csr_pem);
+    let (_, csr) = X509CertificationRequest::from_der(&der).expect("CSR parse failed");
+    csr.verify_signature()
+        .expect("CSR self-signature must verify");
+}
+
+/// Guards the pairing itself: generating the key twice would still pass every
+/// structural assertion above while yielding a certificate whose key the agent
+/// does not hold.
+#[rstest]
+#[case::server(server_csr("agent.example.com", "1.0.0"))]
+#[case::identity(identity_csr("agent.example.com", "1.0.0"))]
+fn returned_private_key_matches_csr_public_key(#[case] out: ans_client::CsrOutput) {
+    let der = pem_to_der(&out.csr_pem);
+    let (_, csr) = X509CertificationRequest::from_der(&der).expect("CSR parse failed");
+    let key = rcgen::KeyPair::from_pem(out.private_key_pem.expose_secret())
+        .expect("returned private key must parse");
+
+    assert_eq!(
+        key.public_key_raw(),
+        csr.certification_request_info
+            .subject_pki
+            .subject_public_key
+            .data
+            .as_ref(),
+        "CSR embeds a different public key than the returned private key"
+    );
+}
+
+// ── Key reuse ─────────────────────────────────────────────────────────────────
+
+/// Renewal reuses the key so the reissued certificate's public key is stable.
+#[test]
+fn supplied_key_pair_is_reused_verbatim() {
+    let first = server_csr("agent.example.com", "1.0.0");
+    let reused = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.1"))
+        .with_key_pair_pem(SecretString::from(
+            first.private_key_pem.expose_secret().to_string(),
+        ))
+        .build()
+        .expect("CSR should build from the supplied key");
+
+    assert_eq!(
+        reused.private_key_pem.expose_secret(),
+        first.private_key_pem.expose_secret()
+    );
+    let (a, b) = (pem_to_der(&first.csr_pem), pem_to_der(&reused.csr_pem));
+    let (_, csr_a) = X509CertificationRequest::from_der(&a).expect("CSR parse failed");
+    let (_, csr_b) = X509CertificationRequest::from_der(&b).expect("CSR parse failed");
+    assert_eq!(
+        csr_a.certification_request_info.subject_pki.raw,
+        csr_b.certification_request_info.subject_pki.raw,
+        "reusing a key must reproduce the same public key"
+    );
+}
+
+/// A supplied ECDSA key must work: the RA accepts P-256, and Method B wants it.
+#[test]
+fn supplied_ecdsa_key_is_accepted() {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 keygen");
+    let out = AnsCsrBuilder::identity(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(SecretString::from(key.serialize_pem()))
+        .build()
+        .expect("P-256 identity CSR should build");
+
+    let der = pem_to_der(&out.csr_pem);
+    let (_, csr) = X509CertificationRequest::from_der(&der).expect("CSR parse failed");
+    csr.verify_signature().expect("P-256 CSR must verify");
+    assert!(matches!(
+        csr.certification_request_info.subject_pki.parsed(),
+        Ok(PublicKey::EC(_))
+    ));
+}
+
+/// Ed25519 is outside the RA's allowlist, so it must fail here rather than at
+/// registration.
+#[test]
+fn supplied_ed25519_key_is_rejected() {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ed25519 keygen");
+    let err = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(SecretString::from(key.serialize_pem()))
+        .build()
+        .expect_err("Ed25519 must be rejected");
+
+    assert!(matches!(err, ans_client::CsrError::UnsupportedKeyAlgorithm));
+}
+
+#[test]
+fn malformed_key_pair_is_rejected() {
+    let err = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(SecretString::from("-----BEGIN PRIVATE KEY-----\nnope\n"))
+        .build()
+        .expect_err("garbage key must be rejected");
+
+    assert!(matches!(err, ans_client::CsrError::InvalidKeyPair(_)));
 }

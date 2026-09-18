@@ -119,7 +119,7 @@ pub mod error;
 pub mod models;
 
 pub use client::{AnsClient, AnsClientBuilder, ApiVersion, Auth};
-pub use csr::{AnsCsrBuilder, CsrOutput};
+pub use csr::{AnsCsrBuilder, CsrError, CsrOutput};
 pub use error::{ClientError, HttpError, Result};
 
 // Re-export types from ans-types for convenience
